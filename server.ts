@@ -21,9 +21,21 @@ const globalForPrisma = globalThis as unknown as { prisma: PrismaClient | undefi
 const prisma =
   globalForPrisma.prisma ??
   new PrismaClient({
-    log: process.env.NODE_ENV === "development" ? ["error", "warn"] : ["error"],
+    log: [
+      { emit: "event", level: "error" },
+      { emit: "event", level: "warn" },
+    ],
   });
 if (process.env.NODE_ENV !== "production") globalForPrisma.prisma = prisma;
+
+(prisma as any).$on?.("error", (e: any) => {
+  const msg = typeof e === "string" ? e : e?.message || JSON.stringify(e);
+  if (msg.includes("E57P01") || msg.includes("terminating connection")) {
+    console.warn("[Database] Ignored transient PostgreSQL connection termination event (E57P01).");
+  } else {
+    console.error("[Database] Prisma Error:", msg);
+  }
+});
 
 // Local JSON File Fallbacks (used if DATABASE_URL is not set or DB connection is unavailable)
 const DB_FILE = path.join(currentDirname, "users_db.json");
@@ -260,7 +272,7 @@ function mapPrismaApplication(app: any): StoredApplication {
   };
 }
 
-// Async Database Access Layer (Prisma Primary, In-Memory/JSON Fallback)
+// Async Database Access Layer (Prisma Primary with automatic reconnect/recovery & In-Memory/JSON Fallback)
 let prismaIsConnected = false;
 
 async function checkPrismaConnection(): Promise<boolean> {
@@ -300,31 +312,62 @@ async function checkPrismaConnection(): Promise<boolean> {
   }
 }
 
-async function dbFindUserByEmail(email: string): Promise<StoredUser | null> {
-  const normalized = email.trim().toLowerCase();
-  if (await checkPrismaConnection()) {
+async function runDbQuery<T>(
+  prismaFn: () => Promise<T>,
+  fallbackFn: () => T | Promise<T>
+): Promise<T> {
+  if (process.env.DATABASE_URL && process.env.DATABASE_URL.trim()) {
     try {
-      const user = await prisma.user.findUnique({ where: { email: normalized } });
-      if (user) return mapPrismaUser(user);
-    } catch (e: any) {
+      const res = await prismaFn();
+      prismaIsConnected = true;
+      return res;
+    } catch (err: any) {
+      console.warn("[Database] Primary Prisma query execution failed:", err?.message || err);
       prismaIsConnected = false;
+
+      // Safe reconnect attempt on connection termination (e.g. E57P01, socket closed, idle timeout)
+      try {
+        await prisma.$disconnect().catch(() => {});
+        await new Promise((r) => setTimeout(r, 100));
+        await prisma.$connect();
+        const retryRes = await prismaFn();
+        prismaIsConnected = true;
+        return retryRes;
+      } catch (retryErr: any) {
+        console.warn("[Database] Prisma reconnect/retry failed, using fallback:", retryErr?.message || retryErr);
+        prismaIsConnected = false;
+      }
     }
   }
-  const users = readUsersDB();
-  return users.find(u => u.email.toLowerCase() === normalized) || null;
+
+  return await fallbackFn();
+}
+
+async function dbFindUserByEmail(email: string): Promise<StoredUser | null> {
+  const normalized = email.trim().toLowerCase();
+  return runDbQuery(
+    async () => {
+      const user = await prisma.user.findUnique({ where: { email: normalized } });
+      return user ? mapPrismaUser(user) : null;
+    },
+    () => {
+      const users = readUsersDB();
+      return users.find(u => u.email.toLowerCase() === normalized) || null;
+    }
+  );
 }
 
 async function dbFindUserById(id: string): Promise<StoredUser | null> {
-  if (await checkPrismaConnection()) {
-    try {
+  return runDbQuery(
+    async () => {
       const user = await prisma.user.findUnique({ where: { id } });
-      if (user) return mapPrismaUser(user);
-    } catch (e: any) {
-      prismaIsConnected = false;
+      return user ? mapPrismaUser(user) : null;
+    },
+    () => {
+      const users = readUsersDB();
+      return users.find(u => u.id === id) || null;
     }
-  }
-  const users = readUsersDB();
-  return users.find(u => u.id === id) || null;
+  );
 }
 
 async function dbCreateUser(data: { id?: string; name: string; email: string; passwordHash: string; role: "job_seeker" | "employer" }): Promise<StoredUser> {
@@ -337,8 +380,8 @@ async function dbCreateUser(data: { id?: string; name: string; email: string; pa
     createdAt: new Date().toISOString()
   };
 
-  if (await checkPrismaConnection()) {
-    try {
+  return runDbQuery(
+    async () => {
       const created = await prisma.user.create({
         data: {
           id: newUser.id,
@@ -349,32 +392,26 @@ async function dbCreateUser(data: { id?: string; name: string; email: string; pa
         }
       });
       return mapPrismaUser(created);
-    } catch (e: any) {
-      prismaIsConnected = false;
+    },
+    () => {
+      const users = readUsersDB();
+      users.push(newUser);
+      writeUsersDB(users);
+      return newUser;
     }
-  }
-
-  const users = readUsersDB();
-  users.push(newUser);
-  writeUsersDB(users);
-  return newUser;
+  );
 }
 
 async function dbGetJobs(filters?: { search?: string; location?: string; type?: string }): Promise<StoredJob[]> {
-  let jobs: StoredJob[] = [];
-  if (await checkPrismaConnection()) {
-    try {
+  let jobs: StoredJob[] = await runDbQuery(
+    async () => {
       const prismaJobs = await prisma.job.findMany({
         orderBy: { createdAt: "desc" }
       });
-      jobs = prismaJobs.map(mapPrismaJob);
-    } catch (e: any) {
-      prismaIsConnected = false;
-      jobs = readJobsDB();
-    }
-  } else {
-    jobs = readJobsDB();
-  }
+      return prismaJobs.map(mapPrismaJob);
+    },
+    () => readJobsDB()
+  );
 
   const { search, location, type } = filters || {};
 
@@ -402,16 +439,16 @@ async function dbGetJobs(filters?: { search?: string; location?: string; type?: 
 }
 
 async function dbGetJobById(id: string): Promise<StoredJob | null> {
-  if (await checkPrismaConnection()) {
-    try {
+  return runDbQuery(
+    async () => {
       const job = await prisma.job.findUnique({ where: { id } });
-      if (job) return mapPrismaJob(job);
-    } catch (e: any) {
-      prismaIsConnected = false;
+      return job ? mapPrismaJob(job) : null;
+    },
+    () => {
+      const jobs = readJobsDB();
+      return jobs.find(j => j.id === id) || null;
     }
-  }
-  const jobs = readJobsDB();
-  return jobs.find(j => j.id === id) || null;
+  );
 }
 
 async function dbCreateJob(data: { id?: string; employer_id: string; title: string; company: string; location: string; type: "Full-Time" | "Part-Time" | "Contract" | "Remote"; salary?: string; description: string }): Promise<StoredJob> {
@@ -427,8 +464,8 @@ async function dbCreateJob(data: { id?: string; employer_id: string; title: stri
     createdAt: new Date().toISOString()
   };
 
-  if (await checkPrismaConnection()) {
-    try {
+  return runDbQuery(
+    async () => {
       const created = await prisma.job.create({
         data: {
           id: newJob.id,
@@ -442,53 +479,50 @@ async function dbCreateJob(data: { id?: string; employer_id: string; title: stri
         }
       });
       return mapPrismaJob(created);
-    } catch (e: any) {
-      prismaIsConnected = false;
+    },
+    () => {
+      const jobs = readJobsDB();
+      jobs.unshift(newJob);
+      writeJobsDB(jobs);
+      return newJob;
     }
-  }
-
-  const jobs = readJobsDB();
-  jobs.unshift(newJob);
-  writeJobsDB(jobs);
-  return newJob;
+  );
 }
 
 async function dbDeleteJob(id: string): Promise<boolean> {
-  if (await checkPrismaConnection()) {
-    try {
+  return runDbQuery(
+    async () => {
       await prisma.job.delete({ where: { id } });
       return true;
-    } catch (e: any) {
-      prismaIsConnected = false;
+    },
+    () => {
+      let jobs = readJobsDB();
+      const initialLen = jobs.length;
+      jobs = jobs.filter(j => j.id !== id);
+      writeJobsDB(jobs);
+      return jobs.length < initialLen;
     }
-  }
-
-  let jobs = readJobsDB();
-  const initialLen = jobs.length;
-  jobs = jobs.filter(j => j.id !== id);
-  writeJobsDB(jobs);
-  return jobs.length < initialLen;
+  );
 }
 
 async function dbFindApplication(jobId: string, applicantId: string): Promise<StoredApplication | null> {
-  if (await checkPrismaConnection()) {
-    try {
+  return runDbQuery(
+    async () => {
       const app = await prisma.application.findFirst({
         where: { jobId, applicantId }
       });
-      if (app) return mapPrismaApplication(app);
-    } catch (e: any) {
-      prismaIsConnected = false;
+      return app ? mapPrismaApplication(app) : null;
+    },
+    () => {
+      const apps = readApplicationsDB();
+      return apps.find(a => a.job_id === jobId && a.applicant_id === applicantId) || null;
     }
-  }
-
-  const apps = readApplicationsDB();
-  return apps.find(a => a.job_id === jobId && a.applicant_id === applicantId) || null;
+  );
 }
 
 async function dbCreateApplication(data: StoredApplication): Promise<StoredApplication> {
-  if (await checkPrismaConnection()) {
-    try {
+  return runDbQuery(
+    async () => {
       const created = await prisma.application.create({
         data: {
           id: data.id,
@@ -503,85 +537,79 @@ async function dbCreateApplication(data: StoredApplication): Promise<StoredAppli
         }
       });
       return mapPrismaApplication(created);
-    } catch (e: any) {
-      prismaIsConnected = false;
+    },
+    () => {
+      const apps = readApplicationsDB();
+      apps.unshift(data);
+      writeApplicationsDB(apps);
+      return data;
     }
-  }
-
-  const apps = readApplicationsDB();
-  apps.unshift(data);
-  writeApplicationsDB(apps);
-  return data;
+  );
 }
 
 async function dbGetApplicationsByUser(applicantId: string): Promise<StoredApplication[]> {
-  if (await checkPrismaConnection()) {
-    try {
+  return runDbQuery(
+    async () => {
       const prismaApps = await prisma.application.findMany({
         where: { applicantId },
         orderBy: { createdAt: "desc" }
       });
       return prismaApps.map(mapPrismaApplication);
-    } catch (e: any) {
-      prismaIsConnected = false;
+    },
+    () => {
+      const apps = readApplicationsDB();
+      return apps.filter(a => a.applicant_id === applicantId);
     }
-  }
-
-  const apps = readApplicationsDB();
-  return apps.filter(a => a.applicant_id === applicantId);
+  );
 }
 
 async function dbGetApplicationsByJob(jobId: string): Promise<StoredApplication[]> {
-  if (await checkPrismaConnection()) {
-    try {
+  return runDbQuery(
+    async () => {
       const prismaApps = await prisma.application.findMany({
         where: { jobId },
         orderBy: { createdAt: "desc" }
       });
       return prismaApps.map(mapPrismaApplication);
-    } catch (e: any) {
-      prismaIsConnected = false;
+    },
+    () => {
+      const apps = readApplicationsDB();
+      return apps.filter(a => a.job_id === jobId);
     }
-  }
-
-  const apps = readApplicationsDB();
-  return apps.filter(a => a.job_id === jobId);
+  );
 }
 
 async function dbGetApplicationById(id: string): Promise<StoredApplication | null> {
-  if (await checkPrismaConnection()) {
-    try {
+  return runDbQuery(
+    async () => {
       const app = await prisma.application.findUnique({ where: { id } });
-      if (app) return mapPrismaApplication(app);
-    } catch (e: any) {
-      prismaIsConnected = false;
+      return app ? mapPrismaApplication(app) : null;
+    },
+    () => {
+      const apps = readApplicationsDB();
+      return apps.find(a => a.id === id) || null;
     }
-  }
-
-  const apps = readApplicationsDB();
-  return apps.find(a => a.id === id) || null;
+  );
 }
 
 async function dbUpdateApplicationStatus(id: string, status: "Submitted" | "Under Review" | "Accepted" | "Rejected"): Promise<StoredApplication | null> {
-  if (await checkPrismaConnection()) {
-    try {
+  return runDbQuery(
+    async () => {
       const updated = await prisma.application.update({
         where: { id },
         data: { status }
       });
       return mapPrismaApplication(updated);
-    } catch (e: any) {
-      prismaIsConnected = false;
+    },
+    () => {
+      const apps = readApplicationsDB();
+      const appIndex = apps.findIndex(a => a.id === id);
+      if (appIndex === -1) return null;
+      apps[appIndex].status = status;
+      writeApplicationsDB(apps);
+      return apps[appIndex];
     }
-  }
-
-  const apps = readApplicationsDB();
-  const appIndex = apps.findIndex(a => a.id === id);
-  if (appIndex === -1) return null;
-
-  apps[appIndex].status = status;
-  writeApplicationsDB(apps);
-  return apps[appIndex];
+  );
 }
 
 function sanitizeUser(user: StoredUser) {
