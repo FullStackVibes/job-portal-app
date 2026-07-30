@@ -55,7 +55,18 @@ export const LoginForm: React.FC<LoginFormProps> = ({ onSuccess, onNavigateRegis
         }),
       });
 
-      const data = await response.json();
+      let data: any = {};
+      const contentType = response.headers.get('content-type');
+      if (contentType && contentType.includes('application/json')) {
+        try {
+          data = await response.json();
+        } catch (jsonErr) {
+          data = { error: 'Invalid JSON response received from server.' };
+        }
+      } else {
+        const text = await response.text();
+        data = { error: text || 'Server returned non-JSON response.' };
+      }
 
       if (!response.ok) {
         setServerError(data.error || 'Invalid email or password.');
@@ -63,9 +74,9 @@ export const LoginForm: React.FC<LoginFormProps> = ({ onSuccess, onNavigateRegis
         login(data.token, data.user);
         onSuccess();
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error('Login error:', err);
-      setServerError('Unable to connect to authentication server. Please check your network.');
+      setServerError(err?.message || 'Unable to connect to authentication server. Please check your network.');
     } finally {
       setIsSubmitting(false);
     }
