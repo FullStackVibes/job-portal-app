@@ -8,8 +8,8 @@ import { PrismaClient } from "@prisma/client";
 import { createServer as createViteServer } from "vite";
 import { fileURLToPath } from "url";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const currentFilename = typeof __filename !== "undefined" ? __filename : fileURLToPath(import.meta.url);
+const currentDirname = typeof __dirname !== "undefined" ? __dirname : path.dirname(currentFilename);
 
 // Environment Configuration
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
@@ -20,9 +20,9 @@ const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "*";
 const prisma = new PrismaClient();
 
 // Local JSON File Fallbacks (used if DATABASE_URL is not set or DB connection is unavailable)
-const DB_FILE = path.join(__dirname, "users_db.json");
-const JOBS_DB_FILE = path.join(__dirname, "jobs_db.json");
-const APPLICATIONS_DB_FILE = path.join(__dirname, "applications_db.json");
+const DB_FILE = path.join(currentDirname, "users_db.json");
+const JOBS_DB_FILE = path.join(currentDirname, "jobs_db.json");
+const APPLICATIONS_DB_FILE = path.join(currentDirname, "applications_db.json");
 
 interface StoredUser {
   id: string;
@@ -545,19 +545,23 @@ function isValidEmail(email: string): boolean {
   return emailRegex.test(email);
 }
 
-async function startServer() {
-  const app = express();
+const app = express();
 
-  // CORS Middleware Configuration
-  app.use(
-    cors({
-      origin: CLIENT_ORIGIN === "*" ? true : CLIENT_ORIGIN,
-      credentials: true
-    })
-  );
+// CORS Middleware Configuration
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // Allow requests with no origin (mobile, curl) or any domain on Vercel/localhost
+      callback(null, true);
+    },
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"]
+  })
+);
 
-  app.use(express.json({ limit: "25mb" }));
-  app.use(express.urlencoded({ limit: "25mb", extended: true }));
+app.use(express.json({ limit: "25mb" }));
+app.use(express.urlencoded({ limit: "25mb", extended: true }));
 
   // --- HEALTH CHECK ENDPOINT ---
   app.get("/api/health", (req, res) => {
@@ -1039,24 +1043,30 @@ async function startServer() {
     }
   });
 
-  // Vite integration
-  if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
-    });
+  // Vite integration and local server start (skipped when running in Vercel serverless environment)
+  async function startLocalServer() {
+    if (!process.env.VERCEL) {
+      if (process.env.NODE_ENV !== "production") {
+        const vite = await createViteServer({
+          server: { middlewareMode: true },
+          appType: "spa",
+        });
+        app.use(vite.middlewares);
+      } else {
+        const distPath = path.join(process.cwd(), "dist");
+        app.use(express.static(distPath));
+        app.get("*", (req, res) => {
+          res.sendFile(path.join(distPath, "index.html"));
+        });
+      }
+
+      app.listen(PORT, "0.0.0.0", () => {
+        console.log(`Server running on http://localhost:${PORT}`);
+      });
+    }
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-  });
-}
+  startLocalServer();
 
-startServer();
+export { app };
+export default app;
