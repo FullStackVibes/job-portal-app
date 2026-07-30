@@ -16,13 +16,24 @@ const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 const JWT_SECRET = process.env.JWT_SECRET || "job_portal_secret_key_2026_dev_mode";
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "*";
 
-// Prisma Client Instance
-const prisma = new PrismaClient();
+// Prisma Client Instance (Singleton pattern for serverless environments)
+const globalForPrisma = globalThis as unknown as { prisma: PrismaClient | undefined };
+const prisma =
+  globalForPrisma.prisma ??
+  new PrismaClient({
+    log: process.env.NODE_ENV === "development" ? ["error", "warn"] : ["error"],
+  });
+if (process.env.NODE_ENV !== "production") globalForPrisma.prisma = prisma;
 
 // Local JSON File Fallbacks (used if DATABASE_URL is not set or DB connection is unavailable)
 const DB_FILE = path.join(currentDirname, "users_db.json");
 const JOBS_DB_FILE = path.join(currentDirname, "jobs_db.json");
 const APPLICATIONS_DB_FILE = path.join(currentDirname, "applications_db.json");
+
+// In-Memory caches for serverless read-only file system safety
+let memoryUsersCache: StoredUser[] | null = null;
+let memoryJobsCache: StoredJob[] | null = null;
+let memoryAppsCache: StoredApplication[] | null = null;
 
 interface StoredUser {
   id: string;
@@ -61,125 +72,149 @@ interface StoredApplication {
 
 // Local JSON File Helpers
 function readUsersDB(): StoredUser[] {
+  if (memoryUsersCache) return memoryUsersCache;
   try {
-    if (!fs.existsSync(DB_FILE)) {
-      const initialUsers: StoredUser[] = [
-        {
-          id: "usr_demo_seeker_1",
-          name: "Alex Rivera",
-          email: "seeker@example.com",
-          passwordHash: bcrypt.hashSync("password123", 10),
-          role: "job_seeker",
-          createdAt: new Date().toISOString()
-        },
-        {
-          id: "usr_demo_employer_1",
-          name: "Acme Corp (Sarah)",
-          email: "employer@example.com",
-          passwordHash: bcrypt.hashSync("password123", 10),
-          role: "employer",
-          createdAt: new Date().toISOString()
-        }
-      ];
-      fs.writeFileSync(DB_FILE, JSON.stringify(initialUsers, null, 2), "utf-8");
-      return initialUsers;
+    if (fs.existsSync(DB_FILE)) {
+      const raw = fs.readFileSync(DB_FILE, "utf-8");
+      memoryUsersCache = JSON.parse(raw);
+      return memoryUsersCache!;
     }
-    const raw = fs.readFileSync(DB_FILE, "utf-8");
-    return JSON.parse(raw);
   } catch (error) {
     console.error("Error reading users DB file:", error);
-    return [];
   }
+
+  const initialUsers: StoredUser[] = [
+    {
+      id: "usr_demo_seeker_1",
+      name: "Alex Rivera",
+      email: "seeker@example.com",
+      passwordHash: bcrypt.hashSync("password123", 10),
+      role: "job_seeker",
+      createdAt: new Date().toISOString()
+    },
+    {
+      id: "usr_demo_employer_1",
+      name: "Acme Corp (Sarah)",
+      email: "employer@example.com",
+      passwordHash: bcrypt.hashSync("password123", 10),
+      role: "employer",
+      createdAt: new Date().toISOString()
+    }
+  ];
+  try {
+    fs.writeFileSync(DB_FILE, JSON.stringify(initialUsers, null, 2), "utf-8");
+  } catch (e) {
+    // Ignore read-only file system errors on serverless platforms
+  }
+  memoryUsersCache = initialUsers;
+  return memoryUsersCache;
 }
 
 function writeUsersDB(users: StoredUser[]): void {
+  memoryUsersCache = users;
   try {
     fs.writeFileSync(DB_FILE, JSON.stringify(users, null, 2), "utf-8");
   } catch (error) {
-    console.error("Error writing users DB file:", error);
+    console.error("Error writing users DB file (using memory cache):", error);
   }
 }
 
 function readJobsDB(): StoredJob[] {
+  if (memoryJobsCache) return memoryJobsCache;
   try {
-    if (!fs.existsSync(JOBS_DB_FILE)) {
-      const initialJobs: StoredJob[] = [
-        {
-          id: "job_demo_1",
-          employer_id: "usr_demo_employer_1",
-          title: "Senior Full Stack Engineer",
-          company: "Acme Corp",
-          location: "San Francisco, CA (Hybrid)",
-          type: "Full-Time",
-          salary: "$140,000 - $175,000 / year",
-          description: "We are looking for an experienced Full Stack Engineer to build high-performance Web applications using TypeScript, React, and Node.js.",
-          createdAt: new Date(Date.now() - 1000 * 60 * 60 * 24 * 2).toISOString()
-        },
-        {
-          id: "job_demo_2",
-          employer_id: "usr_demo_employer_1",
-          title: "Lead UI/UX Designer",
-          company: "Acme Corp",
-          location: "Remote",
-          type: "Remote",
-          salary: "$120,000 - $145,000 / year",
-          description: "Join our design team to craft elegant, user-centered digital experiences for thousands of professionals.",
-          createdAt: new Date(Date.now() - 1000 * 60 * 60 * 24 * 4).toISOString()
-        }
-      ];
-      fs.writeFileSync(JOBS_DB_FILE, JSON.stringify(initialJobs, null, 2), "utf-8");
-      return initialJobs;
+    if (fs.existsSync(JOBS_DB_FILE)) {
+      const raw = fs.readFileSync(JOBS_DB_FILE, "utf-8");
+      memoryJobsCache = JSON.parse(raw);
+      return memoryJobsCache!;
     }
-    const raw = fs.readFileSync(JOBS_DB_FILE, "utf-8");
-    return JSON.parse(raw);
   } catch (error) {
     console.error("Error reading jobs DB file:", error);
-    return [];
   }
+
+  const initialJobs: StoredJob[] = [
+    {
+      id: "job_demo_1",
+      employer_id: "usr_demo_employer_1",
+      title: "Senior Full Stack Engineer",
+      company: "Acme Corp",
+      location: "San Francisco, CA (Hybrid)",
+      type: "Full-Time",
+      salary: "$140,000 - $175,000 / year",
+      description: "We are looking for an experienced Full Stack Engineer to build high-performance Web applications using TypeScript, React, and Node.js.",
+      createdAt: new Date(Date.now() - 1000 * 60 * 60 * 24 * 2).toISOString()
+    },
+    {
+      id: "job_demo_2",
+      employer_id: "usr_demo_employer_1",
+      title: "Lead UI/UX Designer",
+      company: "Acme Corp",
+      location: "Remote",
+      type: "Remote",
+      salary: "$120,000 - $145,000 / year",
+      description: "Join our design team to craft elegant, user-centered digital experiences for thousands of professionals.",
+      createdAt: new Date(Date.now() - 1000 * 60 * 60 * 24 * 4).toISOString()
+    }
+  ];
+  try {
+    fs.writeFileSync(JOBS_DB_FILE, JSON.stringify(initialJobs, null, 2), "utf-8");
+  } catch (e) {
+    // Ignore read-only file system errors on serverless platforms
+  }
+  memoryJobsCache = initialJobs;
+  return memoryJobsCache;
 }
 
 function writeJobsDB(jobs: StoredJob[]): void {
+  memoryJobsCache = jobs;
   try {
     fs.writeFileSync(JOBS_DB_FILE, JSON.stringify(jobs, null, 2), "utf-8");
   } catch (error) {
-    console.error("Error writing jobs DB file:", error);
+    console.error("Error writing jobs DB file (using memory cache):", error);
   }
 }
 
 function readApplicationsDB(): StoredApplication[] {
+  if (memoryAppsCache) return memoryAppsCache;
   try {
-    if (!fs.existsSync(APPLICATIONS_DB_FILE)) {
-      const initialApps: StoredApplication[] = [
-        {
-          id: "app_demo_1",
-          job_id: "job_demo_1",
-          applicant_id: "usr_demo_seeker_1",
-          applicant_name: "Alex Rivera",
-          applicant_email: "seeker@example.com",
-          resume_name: "Alex_Rivera_Senior_FullStack_Resume.pdf",
-          resume_data: "data:application/pdf;base64,JVBERi0xLjQKJ...",
-          resume_size: 245000,
-          cover_letter: "I am excited to submit my application for Senior Full Stack Engineer.",
-          status: "Submitted",
-          createdAt: new Date(Date.now() - 1000 * 60 * 60 * 12).toISOString()
-        }
-      ];
-      fs.writeFileSync(APPLICATIONS_DB_FILE, JSON.stringify(initialApps, null, 2), "utf-8");
-      return initialApps;
+    if (fs.existsSync(APPLICATIONS_DB_FILE)) {
+      const raw = fs.readFileSync(APPLICATIONS_DB_FILE, "utf-8");
+      memoryAppsCache = JSON.parse(raw);
+      return memoryAppsCache!;
     }
-    const raw = fs.readFileSync(APPLICATIONS_DB_FILE, "utf-8");
-    return JSON.parse(raw);
   } catch (error) {
     console.error("Error reading applications DB file:", error);
-    return [];
   }
+
+  const initialApps: StoredApplication[] = [
+    {
+      id: "app_demo_1",
+      job_id: "job_demo_1",
+      applicant_id: "usr_demo_seeker_1",
+      applicant_name: "Alex Rivera",
+      applicant_email: "seeker@example.com",
+      resume_name: "Alex_Rivera_Senior_FullStack_Resume.pdf",
+      resume_data: "data:application/pdf;base64,JVBERi0xLjQKJ...",
+      resume_size: 245000,
+      cover_letter: "I am excited to submit my application for Senior Full Stack Engineer.",
+      status: "Submitted",
+      createdAt: new Date(Date.now() - 1000 * 60 * 60 * 12).toISOString()
+    }
+  ];
+  try {
+    fs.writeFileSync(APPLICATIONS_DB_FILE, JSON.stringify(initialApps, null, 2), "utf-8");
+  } catch (e) {
+    // Ignore read-only file system errors on serverless platforms
+  }
+  memoryAppsCache = initialApps;
+  return memoryAppsCache;
 }
 
 function writeApplicationsDB(apps: StoredApplication[]): void {
+  memoryAppsCache = apps;
   try {
     fs.writeFileSync(APPLICATIONS_DB_FILE, JSON.stringify(apps, null, 2), "utf-8");
   } catch (error) {
-    console.error("Error writing applications DB file:", error);
+    console.error("Error writing applications DB file (using memory cache):", error);
   }
 }
 
@@ -225,8 +260,7 @@ function mapPrismaApplication(app: any): StoredApplication {
   };
 }
 
-// Async Database Access Layer (Prisma Primary, Local JSON Fallback)
-let prismaConnectionTested = false;
+// Async Database Access Layer (Prisma Primary, In-Memory/JSON Fallback)
 let prismaIsConnected = false;
 
 async function checkPrismaConnection(): Promise<boolean> {
@@ -234,18 +268,33 @@ async function checkPrismaConnection(): Promise<boolean> {
     return true;
   }
 
-  if (!process.env.DATABASE_URL) {
+  if (!process.env.DATABASE_URL || !process.env.DATABASE_URL.trim()) {
     return false;
   }
 
   try {
-    await prisma.$connect();
-    // Test that the schema tables exist and can be queried
-    await prisma.user.findFirst();
-    prismaIsConnected = true;
-    console.log("[Database] Connected to PostgreSQL via Prisma successfully.");
-    return true;
+    const connectPromise = (async () => {
+      await prisma.$connect();
+      await prisma.user.findFirst({ select: { id: true } });
+      return true;
+    })();
+
+    const timeoutPromise = new Promise<boolean>((resolve) => {
+      setTimeout(() => resolve(false), 3000);
+    });
+
+    const isOk = await Promise.race([connectPromise, timeoutPromise]);
+    if (isOk) {
+      prismaIsConnected = true;
+      console.log("[Database] Connected to PostgreSQL via Prisma successfully.");
+      return true;
+    } else {
+      console.warn("[Database] Connection to PostgreSQL timed out; using in-memory fallback.");
+      prismaIsConnected = false;
+      return false;
+    }
   } catch (err: any) {
+    console.warn("[Database] Connection to PostgreSQL failed; using fallback:", err?.message || err);
     prismaIsConnected = false;
     return false;
   }
@@ -1041,6 +1090,18 @@ app.use(express.urlencoded({ limit: "25mb", extended: true }));
       console.error("Error updating application status:", err);
       return res.status(500).json({ error: "Failed to update application status." });
     }
+  });
+
+  // Global Express Error Handler for Vercel/production JSON error responses
+  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    console.error("Express API Global Error:", err);
+    if (res.headersSent) {
+      return next(err);
+    }
+    const statusCode = err.status || err.statusCode || 500;
+    return res.status(statusCode).json({
+      error: err.message || "An unexpected server error occurred during request processing."
+    });
   });
 
   // Vite integration and local server start (skipped when running in Vercel serverless environment)

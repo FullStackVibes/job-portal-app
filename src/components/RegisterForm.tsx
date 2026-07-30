@@ -75,7 +75,18 @@ export const RegisterForm: React.FC<RegisterFormProps> = ({ onSuccess, onNavigat
         }),
       });
 
-      const data = await response.json();
+      let data: any = {};
+      const contentType = response.headers.get('content-type');
+      if (contentType && contentType.includes('application/json')) {
+        try {
+          data = await response.json();
+        } catch (jsonErr) {
+          data = { error: 'Invalid JSON response received from server.' };
+        }
+      } else {
+        const text = await response.text();
+        data = { error: text || 'Server returned non-JSON response.' };
+      }
 
       if (!response.ok) {
         setServerError(data.error || 'Registration failed. Please check your inputs.');
@@ -83,9 +94,9 @@ export const RegisterForm: React.FC<RegisterFormProps> = ({ onSuccess, onNavigat
         register(data.token, data.user);
         onSuccess();
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error('Registration error:', err);
-      setServerError('Unable to connect to registration server. Please try again.');
+      setServerError(err?.message || 'Unable to connect to registration server. Please try again.');
     } finally {
       setIsSubmitting(false);
     }
