@@ -1,0 +1,6 @@
+{
+  "name": "Job Portal",
+  "description": "Job Portal platform with user authentication, role management, public job board, and employer listing creation",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
